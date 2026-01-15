@@ -1,0 +1,460 @@
+// === Inlined from ../kernels/Replay.dfy ===
+abstract module {:compile false} Domain {
+  type Model
+  type Action
+
+  ghost predicate Inv(m: Model)
+
+  function Init(): Model
+  function Apply(m: Model, a: Action): Model
+    requires Inv(m)
+  function Normalize(m: Model): Model
+
+  lemma InitSatisfiesInv()
+    ensures Inv(Init())
+
+  lemma StepPreservesInv(m: Model, a: Action)
+    requires Inv(m)
+    ensures Inv(Normalize(Apply(m,a)))
+}
+
+abstract module {:compile false} Kernel {
+  import D : Domain
+
+  function Step(m: D.Model, a: D.Action): D.Model
+  requires D.Inv(m)
+  {
+    D.Normalize(D.Apply(m, a))
+  }
+
+  function InitHistory(): History {
+    History([], D.Init(), [])
+  }
+
+  datatype History =
+    History(past: seq<D.Model>, present: D.Model, future: seq<D.Model>)
+
+  function Do(h: History, a: D.Action): History
+  requires D.Inv(h.present)
+  {
+    History(h.past + [h.present], Step(h.present, a), [])
+  }
+
+  // Apply action without recording to history (for live preview during drag)
+  function Preview(h: History, a: D.Action): History
+  requires D.Inv(h.present)
+  {
+    History(h.past, Step(h.present, a), h.future)
+  }
+
+  // Commit current state, recording baseline to history (for end of drag)
+  function CommitFrom(h: History, baseline: D.Model): History {
+    History(h.past + [baseline], h.present, [])
+  }
+
+  function Undo(h: History): History {
+    if |h.past| == 0 then h
+    else
+      var i := |h.past| - 1;
+      History(h.past[..i], h.past[i], [h.present] + h.future)
+  }
+
+  function Redo(h: History): History {
+    if |h.future| == 0 then h
+    else
+      History(h.past + [h.present], h.future[0], h.future[1..])
+  }
+
+  lemma DoPreservesInv(h: History, a: D.Action)
+    requires D.Inv(h.present)
+    ensures  D.Inv(Do(h, a).present)
+  {
+  }
+
+  ghost predicate HistInv(h: History) {
+    (forall i | 0 <= i < |h.past| :: D.Inv(h.past[i])) &&
+    D.Inv(h.present) &&
+    (forall j | 0 <= j < |h.future| :: D.Inv(h.future[j]))
+  }
+
+  lemma InitHistorySatisfiesInv()
+    ensures HistInv(InitHistory())
+  {
+  }
+
+  lemma UndoPreservesHistInv(h: History)
+    requires HistInv(h)
+    ensures  HistInv(Undo(h))
+  {
+  }
+
+  lemma RedoPreservesHistInv(h: History)
+    requires HistInv(h)
+    ensures  HistInv(Redo(h))
+  {
+  }
+
+  lemma DoPreservesHistInv(h: History, a: D.Action)
+    requires HistInv(h)
+    ensures  HistInv(Do(h, a))
+  {
+  }
+
+  lemma PreviewPreservesHistInv(h: History, a: D.Action)
+    requires HistInv(h)
+    ensures  HistInv(Preview(h, a))
+  {
+  }
+
+  lemma CommitFromPreservesHistInv(h: History, baseline: D.Model)
+    requires HistInv(h)
+    requires D.Inv(baseline)
+    ensures  HistInv(CommitFrom(h, baseline))
+  {
+  }
+
+  // proxy for linear undo: after a new action, there is no redo branch
+  lemma DoHasNoRedoBranch(h: History, a: D.Action)
+  requires HistInv(h)
+  ensures Redo(Do(h, a)) == Do(h, a)
+  {
+  }
+  // round-tripping properties
+  lemma UndoRedoRoundTrip(h: History)
+  requires |h.past| > 0
+  ensures Redo(Undo(h)) == h
+  {
+  }
+  lemma RedoUndoRoundTrip(h: History)
+  requires |h.future| > 0
+  ensures Undo(Redo(h)) == h
+  {
+  }
+  // idempotence at boundaries
+  lemma UndoAtBeginningIsNoOp(h: History)
+  requires |h.past| == 0
+  ensures Undo(h) == h
+  {
+  }
+  lemma RedoAtEndIsNoOp(h: History)
+  requires |h.future| == 0
+  ensures Redo(h) == h
+  {
+  }
+}
+
+// === End ../kernels/Replay.dfy ===
+
+// Goal: prove preservation of
+// - A1 (exact partition, no duplicates)
+// - B (WIP limits)
+// for a dynamic-column Kanban reducer under undo/redo replay.
+
+module KanbanDomain refines Domain {
+  // user facing
+  type ColId = string
+  // allocated by model
+  type CardId = nat
+
+  datatype Card = Card(title: string)
+
+  datatype Model = Model(
+    cols: seq<ColId>,                 // authoritative list of columns
+    lanes: map<ColId, seq<CardId>>,   // column -> ordered card ids
+    wip: map<ColId, nat>,             // column -> limit (nat); use a large number for "unlimited"
+    cards: map<CardId, Card>,         // id -> payload
+    nextId: nat                       // fresh allocator
+  )
+
+  datatype Action =
+    | AddColumn(col: ColId, limit: nat)
+    | SetWip(col: ColId, limit: nat)
+    | AddCard(col: ColId, title: string)          // allocates nextId if succeeds
+    | MoveCard(id: CardId, toCol: ColId, pos: int)
+
+  // --------------------------
+  // Helpers (sequence reasoning)
+  // --------------------------
+
+  function get<K,V>(s: map<K, V>, c: K, default: V): V
+  {
+    if c in s then s[c] else default
+  }
+
+  function Lane(lanes: map<ColId, seq<CardId>>, c: ColId): seq<CardId>
+  {
+    get(lanes, c, [])
+  }
+
+  function Wip(wip: map<ColId, nat>, c: ColId): nat
+  {
+    get(wip, c, 0)
+  }
+
+  ghost predicate NoDupSeq<T>(s: seq<T>)
+  {
+    forall i, j :: 0 <= i < j < |s| ==> s[i] != s[j]
+  }
+
+  function ClampPos(pos: int, n: int): nat
+    requires n >= 0
+  {
+    if pos <= 0 then 0
+    else if pos >= n then n as nat
+    else pos as nat
+  }
+
+  function RemoveFirst<T(==)>(s: seq<T>, x: T): seq<T>
+  {
+    if |s| == 0 then []
+    else if s[0] == x then s[1..]
+    else [s[0]] + RemoveFirst(s[1..], x)
+  }
+
+  function InsertAt<T>(s: seq<T>, i: nat, x: T): seq<T>
+    requires i <= |s|
+  {
+    s[..i] + [x] + s[i..]
+  }
+
+  function FlatColsPosition(cols: seq<ColId>, lanes: map<ColId, seq<CardId>>, c: nat, i: nat): nat
+    requires c < |cols|
+    requires i < |Lane(lanes, cols[c])|
+  {
+    if c == 0 then i
+    else |Lane(lanes, cols[0])| + FlatColsPosition(cols[1..], lanes, c-1, i)
+  }
+
+  // Flatten lanes in the order of cols
+  function AllIds(m: Model): seq<CardId>
+  {
+    match m
+    case Model(cols, lanes, wip, cards, nextId) =>
+      FlattenCols(cols, lanes)
+  }
+
+  function FlattenCols(cols: seq<ColId>, lanes: map<ColId, seq<CardId>>): seq<CardId>
+  {
+    if |cols| == 0 then []
+    else Lane(lanes, cols[0]) + FlattenCols(cols[1..], lanes)
+  }
+
+  // Does a card id occur in some lane?
+  predicate OccursInLanes(m: Model, id: CardId)
+  {
+    exists i :: 0 <= i < |m.cols| && (exists j :: 0 <= j < |Lane(m.lanes, m.cols[i])| && Lane(m.lanes, m.cols[i])[j] == id)
+  }
+
+  // --------------------------
+  // Invariant (A1 + B + column well-formedness)
+  // --------------------------
+  ghost predicate Inv(m: Model)
+  {
+    // Column list well-formed
+    NoDupSeq(m.cols) &&
+
+    // Lanes/wip defined exactly on existing columns
+    (forall i :: 0 <= i < |m.cols| ==> m.cols[i] in m.lanes && m.cols[i] in m.wip) &&
+    (forall c :: c in m.lanes ==> c in m.cols) &&
+    (forall c :: c in m.wip ==> c in m.cols) &&
+
+    // A1: exact partition (no disappear / no duplicate)
+    NoDupSeq(AllIds(m)) &&
+    (forall id :: id in m.cards <==> OccursInLanes(m, id)) &&
+
+    // B: WIP limits
+    (forall i :: 0 <= i < |m.cols| ==> |m.lanes[m.cols[i]]| <= m.wip[m.cols[i]]) &&
+
+    // Allocator is fresh
+    (forall id :: id in m.cards ==> id < m.nextId)
+  }
+
+  // --------------------------
+  // Init
+  // --------------------------
+  function Init(): Model {
+    Model([], map[], map[], map[], 0)
+  }
+
+  // --------------------------
+  // Normalize
+  // --------------------------
+  // For now, Normalize is the identity.
+  // That keeps semantics simple and makes "no-op on violation" exact.
+  //
+  // If you later want Normalize to "repair" (e.g., drop unknown columns,
+  // clamp positions, etc.), this is the hook point.
+  function Normalize(m: Model): Model { m }
+
+  // --------------------------
+  // Apply
+  // --------------------------
+  function Apply(m: Model, a: Action): Model
+  {
+    match m
+    case Model(cols, lanes, wip, cards, nextId) =>
+      match a
+      case AddColumn(col, limit) =>
+        if col in cols then m
+        else
+          // add an empty lane and a wip entry
+          Model(cols + [col],
+                lanes[col := []],
+                wip[col := limit],
+                cards,
+                nextId)
+
+      case SetWip(col, limit) =>
+        if !(col in cols) then m
+        else if limit < |Lane(lanes, col)| then m
+        else Model(cols, lanes, wip[col := limit], cards, nextId)
+
+      case AddCard(col, title) =>
+        if !(col in cols) then m
+        else if |Lane(lanes, col)| + 1 > (Wip(wip, col)) then m
+        else
+          var id := nextId;
+          Model(cols,
+                lanes[col := Lane(lanes, col) + [id]],
+                wip,
+                cards[id := Card(title)],
+                nextId + 1)
+
+      case MoveCard(id, toCol, pos) =>
+        if !(toCol in cols) then m
+        else if !(id in cards) then m
+        else
+          // Find the source column by scanning cols
+          var src := FindColumnOf(cols, lanes, id);
+          if src == "" then m // should be impossible under Inv; safe fallback
+          else if src == toCol then
+            // reorder within same column (still checks WIP trivially)
+            var s := Lane(lanes, src);
+            var s1 := RemoveFirst(s, id);
+            var k := ClampPos(pos, |s1|);
+            Model(cols, lanes[src := InsertAt(s1, k, id)], wip, cards, nextId)
+          else
+            // cross-column move: check WIP of destination
+            if |Lane(lanes, toCol)| + 1 > (Wip(wip, toCol)) then m
+            else
+              var s := Lane(lanes, src);
+              var t := Lane(lanes, toCol);
+              var s1 := RemoveFirst(s, id);
+              var k := ClampPos(pos, |t|);
+              var t1 := InsertAt(t, k, id);
+              Model(cols, lanes[src := s1][toCol := t1], wip, cards, nextId)
+  }
+
+  // Helper: find which column contains id; returns "" if not found.
+  function FindColumnOf(cols: seq<ColId>, lanes: map<ColId, seq<CardId>>, id: CardId): ColId
+  {
+    if |cols| == 0 then ""
+    else if SeqContains(Lane(lanes, cols[0]), id) then cols[0]
+    else FindColumnOf(cols[1..], lanes, id)
+  }
+
+  function SeqContains<T(==)>(s: seq<T>, x: T): bool
+  {
+    exists i :: 0 <= i < |s| && s[i] == x
+  }
+
+  // --------------------------
+  // The required lemmas for dafny-replay
+  // --------------------------
+
+  //
+  // This is the only thing the replay kernel needs from the domain:
+  // Step preserves Inv (possibly after Normalize, but Normalize is identity here).
+  //
+  // Proof strategy:
+  // - case split on action
+  // - every branch is either "no-op" (model unchanged) or a local update
+  // - show:
+  //   * column keys preserved
+  //   * cards moved/added without duplication
+  //   * WIP checked before insertion
+  //
+  // --------------------------
+  // Helper lemmas
+  // --------------------------
+
+   // RemoveFirst lemmas
+  // When NoDupSeq, removing x gives us everything except x
+  // InsertAt lemmas
+  // Key lemma for same-column reorder: removing and reinserting same element preserves NoDup
+  // Contents after remove-insert is the same
+  // FlattenCols when one lane changes by remove-insert (same column reorder)
+  // FlattenCols for cross-column move: remove from src, insert into dest
+  // Helper for FindColumnOf
+  // Single lane update: add id to one lane
+  // Single lane update: remove id from one lane
+  // Helper lemma: if id is in a sequence, it's contained
+  lemma SeqContainsWitness<T>(s: seq<T>, x: T, idx: nat)
+    requires idx < |s|
+    requires s[idx] == x
+    ensures SeqContains(s, x)
+  {
+  }
+
+  // Helper: OccursInLanes with a witness
+  // AllIds contains exactly what's in the lanes
+  // If head of NoDupSeq equals x, then x is not in tail
+  // NoDupSeq preserved when appending a fresh element
+  // Helper for updating a single lane
+  lemma FlattenColsUpdateLane(cols: seq<ColId>, lanes: map<ColId, seq<CardId>>, col: ColId, newLane: seq<CardId>)
+    requires col in lanes
+    requires col in cols
+    ensures forall c :: c in cols && c != col ==> Lane(lanes[col := newLane], c) == Lane(lanes, c)
+  {
+  }
+
+  lemma ConcatNoDupWithFreshAppend<T>(a: seq<T>, b: seq<T>, x: T)
+    requires NoDupSeq(a + b)
+    requires !SeqContains(a, x)
+    requires !SeqContains(b, x)
+    ensures NoDupSeq(a + (b + [x]))
+  {
+  }
+
+  // NoDupSeq when appending an element not in the sequence
+  // FlattenCols with appended empty lane
+  // FlattenCols is the same when lanes agree on all columns
+  // freshId not in AllIds when >= nextId and Inv holds
+  }
+
+module KanbanKernel refines Kernel {
+  import D = KanbanDomain
+}
+
+module KanbanAppCore {
+  import K = KanbanKernel
+  import D = KanbanDomain
+
+  function Init(): K.History {
+    K.InitHistory()
+  }
+
+  // Action constructors
+  function AddColumn(col: string, limit: nat): D.Action { D.AddColumn(col, limit) }
+  function SetWip(col: string, limit: nat): D.Action { D.SetWip(col, limit) }
+  function AddCard(col: string, title: string): D.Action { D.AddCard(col, title) }
+  function MoveCard(id: nat, toCol: string, pos: int): D.Action { D.MoveCard(id, toCol, pos) }
+
+  // State transitions
+  function Dispatch(h: K.History, a: D.Action): K.History requires K.HistInv(h) { K.Do(h, a) }
+  function Undo(h: K.History): K.History { K.Undo(h) }
+  function Redo(h: K.History): K.History { K.Redo(h) }
+
+  // Selectors
+  function Present(h: K.History): D.Model { h.present }
+  function CanUndo(h: K.History): bool { |h.past| > 0 }
+  function CanRedo(h: K.History): bool { |h.future| > 0 }
+
+  // Model accessors for JavaScript
+  function GetCols(m: D.Model): seq<string> { m.cols }
+  function GetLane(m: D.Model, col: string): seq<nat> { D.Lane(m.lanes, col) }
+  function GetWip(m: D.Model, col: string): nat { D.Wip(m.wip, col) }
+  function GetCardTitle(m: D.Model, id: nat): string {
+    if id in m.cards then m.cards[id].title else ""
+  }
+}

@@ -1,0 +1,1757 @@
+/*
+ColorWheelProps.dfy - Behavioral Properties of the ColorWheel Spec
+
+== Commutativity with SelectContrastPair ==
+
+SelectContrastPairCommutesWithAdjustColor:
+  Selecting a contrast pair and adjusting a color can be done in either
+  order -- the result is the same.
+
+SelectContrastPairCommutesWithAdjustPalette:
+  Selecting a contrast pair and adjusting the entire palette can be done
+  in either order -- the result is the same.
+
+SelectContrastPairCommutesWithSetColorDirect:
+  Selecting a contrast pair and setting a color directly can be done in
+  either order -- the result is the same.
+
+SelectContrastPairIdempotent:
+  Selecting the same contrast pair twice is the same as selecting it once.
+
+== AdjustColor Commutativity ==
+
+AdjustColorCommutes:
+  Adjusting two different colors can be done in either order -- the result
+  is the same.
+
+AdjustColorIndependentColors:
+  When adjusting two different colors, the final color values are the same
+  regardless of order.
+
+AdjustColorMoodMonotonic:
+  When adjusting two different colors, the final mood is the same regardless
+  of order. (If either adjustment breaks the mood to Custom, both paths end
+  up at Custom.)
+
+AdjustColorHarmonyMonotonic:
+  When adjusting two different colors, the final harmony is the same
+  regardless of order. (If either adjustment breaks the harmony to Custom,
+  both paths end up at Custom.)
+
+== GeneratePalette Properties ==
+
+GeneratePaletteResetsAdjustments:
+  Generating a new palette resets all cumulative adjustments (H, S, L) to zero.
+
+GeneratePaletteIdempotent:
+  Generating a palette with the same parameters twice in a row produces the
+  same result as doing it once.
+
+== Monotonicity of Degradation ==
+
+MoodOnlyDegradesToCustom:
+  AdjustColor can only change mood from a named mood to Custom, never the
+  reverse. Once mood is Custom, AdjustColor keeps it Custom.
+
+HarmonyOnlyDegradesToCustom:
+  AdjustColor can only change harmony from a named harmony to Custom, never
+  the reverse. Once harmony is Custom, AdjustColor keeps it Custom.
+
+== Reachability ==
+
+CanReachAnyColor:
+  From any valid model, any valid color can be set at any index using
+  SetColorDirect (though this may degrade mood/harmony to Custom).
+
+CanRecoverMood:
+  From any model (even with Custom mood), any named mood can be restored
+  using RegenerateMood with appropriate seeds.
+
+CanRecoverHarmony:
+  From any model (even with Custom harmony), any named harmony can be
+  restored using RegenerateHarmony with appropriate seeds.
+
+== Field Independence ==
+
+ContrastPairIndependentOfColors:
+  AdjustColor, AdjustPalette, and SetColorDirect never change contrastPair.
+
+ColorsIndependentOfContrastPair:
+  SelectContrastPair never changes colors, mood, harmony, or baseHue.
+
+== Domain-Specific: Harmony Geometry ==
+
+ComplementaryAre180Apart:
+  When harmony is Complementary, the first two base hues differ by exactly 180 degrees.
+
+TriadicAre120Apart:
+  When harmony is Triadic, the three base hues are 120 degrees apart.
+
+AnalogousWithin30:
+  When harmony is Analogous, all five hues are within 30 degrees of baseHue.
+*/
+
+// === Inlined from ColorWheelSpec.dfy ===
+// ColorWheel Domain Specification
+// A verified color palette generator with mood + harmony constraints
+
+module ColorWheelSpec {
+
+  // ============================================================================
+  // Core Types
+  // ============================================================================
+
+  datatype Color = Color(h: int, s: int, l: int)
+
+  datatype Mood =
+    | Vibrant      // S ≥ 70,  40 ≤ L ≤ 60
+    | SoftMuted    // 20 ≤ S ≤ 45, 55 ≤ L ≤ 75
+    | Pastel       // S ≤ 35,  L ≥ 75
+    | DeepJewel    // S ≥ 60,  25 ≤ L ≤ 45
+    | Earth        // 15 ≤ S ≤ 40, 30 ≤ L ≤ 60
+    | Neon         // S ≥ 90,  50 ≤ L ≤ 65
+    | Custom       // No S/L constraints
+
+  datatype Harmony =
+    | Complementary     // 2 base hues: [H₀, H₀+180°] + 3 variations
+    | Triadic           // 3 base hues: [H₀, H₀+120°, H₀+240°] + 2 variations
+    | Analogous         // 5 hues: [H₀-30°, H₀-15°, H₀, H₀+15°, H₀+30°]
+    | SplitComplement   // 3 base hues: [H₀, H₀+150°, H₀+210°] + 2 variations
+    | Square            // 4 base hues: [H₀, H₀+90°, H₀+180°, H₀+270°] + 1 variation
+    | Custom            // No hue relationship
+
+  datatype Model = Model(
+    baseHue: int,                    // 0-359, the anchor hue
+    mood: Mood,
+    harmony: Harmony,
+    colors: seq<Color>,              // Always exactly 5 colors
+    contrastPair: (int, int),        // (foreground index, background index)
+    // Cumulative palette adjustments (for UI slider display)
+    adjustmentH: int,                // Cumulative hue adjustment
+    adjustmentS: int,                // Cumulative saturation adjustment
+    adjustmentL: int                 // Cumulative lightness adjustment
+  )
+
+  datatype Action =
+    // randomSeeds: 10 values [0-100] for random S/L generation (2 per color)
+    | GeneratePalette(baseHue: int, mood: Mood, harmony: Harmony, randomSeeds: seq<int>)
+    | AdjustColor(index: int, deltaH: int, deltaS: int, deltaL: int)
+    // AdjustPalette: Applies linked adjustment to ALL colors
+    | AdjustPalette(deltaH: int, deltaS: int, deltaL: int)
+    | SelectContrastPair(fg: int, bg: int)
+    | SetColorDirect(index: int, color: Color)
+    // randomSeeds: 10 values for regenerating colors with new mood
+    | RegenerateMood(mood: Mood, randomSeeds: seq<int>)
+    // randomSeeds: 10 values for regenerating colors with new harmony
+    | RegenerateHarmony(harmony: Harmony, randomSeeds: seq<int>)
+    // newBaseHue + randomSeeds: pick new base, regenerate
+    | RandomizeBaseHue(newBaseHue: int, randomSeeds: seq<int>)
+
+  // ============================================================================
+  // Helper Functions
+  // ============================================================================
+
+  function Clamp(x: int, min: int, max: int): int {
+    if x < min then min
+    else if x > max then max
+    else x
+  }
+
+  function NormalizeHue(h: int): int {
+    var normalized := h % 360;
+    if normalized < 0 then normalized + 360 else normalized
+  }
+
+  function ClampColor(c: Color): Color {
+    Color(
+      NormalizeHue(c.h),
+      Clamp(c.s, 0, 100),
+      Clamp(c.l, 0, 100)
+    )
+  }
+
+  // ============================================================================
+  // Mood Predicates
+  // ============================================================================
+
+  predicate ValidColor(c: Color) {
+    0 <= c.h < 360 && 0 <= c.s <= 100 && 0 <= c.l <= 100
+  }
+
+  predicate ValidBaseHue(h: int) {
+    0 <= h < 360
+  }
+
+  predicate ColorSatisfiesMood(c: Color, mood: Mood) {
+    match mood
+    case Vibrant    => c.s >= 70 && 40 <= c.l <= 60
+    case SoftMuted  => 20 <= c.s <= 45 && 55 <= c.l <= 75
+    case Pastel     => c.s <= 35 && c.l >= 75
+    case DeepJewel  => c.s >= 60 && 25 <= c.l <= 45
+    case Earth      => 15 <= c.s <= 40 && 30 <= c.l <= 60
+    case Neon       => c.s >= 90 && 50 <= c.l <= 65
+    case Custom     => true
+  }
+
+  // Returns (minS, maxS, minL, maxL) bounds for a given mood
+  function MoodBounds(mood: Mood): (int, int, int, int) {
+    match mood
+    case Vibrant    => (70, 100, 40, 60)
+    case SoftMuted  => (20, 45, 55, 75)
+    case Pastel     => (0, 35, 75, 100)
+    case DeepJewel  => (60, 100, 25, 45)
+    case Earth      => (15, 40, 30, 60)
+    case Neon       => (90, 100, 50, 65)
+    case Custom     => (0, 100, 0, 100)
+  }
+
+  // Map a random seed [0-100] to a value in [min, max]
+  function RandomInRange(seed: int, min: int, max: int): int
+    requires 0 <= seed <= 100
+    requires min <= max
+  {
+    if min == max then min
+    else min + (seed * (max - min)) / 100
+  }
+
+  // Generate random (S, L) within mood bounds using two random seeds
+  function RandomSLForMood(mood: Mood, seedS: int, seedL: int): (int, int)
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (minS, maxS, minL, maxL) := MoodBounds(mood);
+    (RandomInRange(seedS, minS, maxS), RandomInRange(seedL, minL, maxL))
+  }
+
+  // Golden ratio approximation * 100 = 61.8 ≈ 62
+  // Golden ratio distribution avoids clustering and maximizes visual distinction
+  const GoldenOffset: int := 62
+
+  // Generate (S, L) using golden ratio distribution for maximum variance
+  // Each color's position is offset by golden ratio, ensuring even distribution
+  // and dramatic changes between regenerations
+  function GoldenSLForMood(mood: Mood, colorIndex: int, seedS: int, seedL: int): (int, int)
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (minS, maxS, minL, maxL) := MoodBounds(mood);
+
+    // Golden ratio offset creates mathematically optimal distribution
+    // Using different multipliers for S and L to avoid correlation
+    var spreadS := (seedS + colorIndex * GoldenOffset) % 101;
+    var spreadL := (seedL + colorIndex * 38) % 101;  // 38 ≈ 62 * 0.618 (nested golden)
+
+    (RandomInRange(spreadS, minS, maxS), RandomInRange(spreadL, minL, maxL))
+  }
+
+  // ============================================================================
+  // Harmony Functions
+  // ============================================================================
+
+  // Returns the base harmony hues (before padding to 5)
+  function BaseHarmonyHues(baseHue: int, harmony: Harmony): seq<int> {
+    match harmony
+    case Complementary   => [baseHue, NormalizeHue(baseHue + 180)]
+    case Triadic         => [baseHue, NormalizeHue(baseHue + 120), NormalizeHue(baseHue + 240)]
+    case Analogous       => [NormalizeHue(baseHue - 30), NormalizeHue(baseHue - 15),
+                             baseHue, NormalizeHue(baseHue + 15), NormalizeHue(baseHue + 30)]
+    case SplitComplement => [baseHue, NormalizeHue(baseHue + 150), NormalizeHue(baseHue + 210)]
+    case Square          => [baseHue, NormalizeHue(baseHue + 90),
+                             NormalizeHue(baseHue + 180), NormalizeHue(baseHue + 270)]
+    case Custom          => [] // No constraint
+  }
+
+  // Hue spread offset for creating variation in repeated hues
+  // 35° provides better visual distinction than 20° while staying within harmony "feel"
+  const HueSpread: int := 35
+
+  // Returns all 5 hues for a harmony (with spreading for variety)
+  // Instead of repeating exact hues, we spread them by ±HueSpread degrees
+  function AllHarmonyHues(baseHue: int, harmony: Harmony): seq<int> {
+    var base := BaseHarmonyHues(baseHue, harmony);
+    if harmony == Harmony.Custom then []
+    else if |base| == 5 then base  // Analogous: already 5 distinct hues
+    else if |base| == 4 then
+      // Square: add midpoint between first two hues
+      base + [NormalizeHue(baseHue + 45)]
+    else if |base| == 3 then
+      // Triadic/Split: spread the first two base hues
+      base + [NormalizeHue(base[0] + HueSpread), NormalizeHue(base[1] - HueSpread)]
+    else if |base| == 2 then
+      // Complementary: spread both base hues
+      base + [NormalizeHue(base[0] + HueSpread),
+              NormalizeHue(base[1] + HueSpread),
+              NormalizeHue(base[0] - HueSpread)]
+    else []
+  }
+
+  // Check if a color palette's hues match the expected harmony pattern
+  predicate HuesMatchHarmony(colors: seq<Color>, baseHue: int, harmony: Harmony) {
+    if harmony == Harmony.Custom then true
+    else
+      var expectedHues := AllHarmonyHues(baseHue, harmony);
+      |colors| == 5 && |expectedHues| == 5 &&
+      forall i | 0 <= i < 5 :: colors[i].h == expectedHues[i]
+  }
+
+  // ============================================================================
+  // Main Invariant
+  // ============================================================================
+
+  predicate Inv(m: Model) {
+    && ValidBaseHue(m.baseHue)
+    && |m.colors| == 5
+    && (forall i | 0 <= i < 5 :: ValidColor(m.colors[i]))
+    && 0 <= m.contrastPair.0 < 5
+    && 0 <= m.contrastPair.1 < 5
+    // Mood constraint: all colors satisfy mood (unless Custom)
+    && (m.mood != Mood.Custom ==>
+          forall i | 0 <= i < 5 :: ColorSatisfiesMood(m.colors[i], m.mood))
+    // Harmony constraint: hues follow harmony pattern (unless Custom)
+    && HuesMatchHarmony(m.colors, m.baseHue, m.harmony)
+  }
+
+  // ============================================================================
+  // Initial State
+  // ============================================================================
+
+  function Init(): Model {
+    var randomSeeds := [50, 50, 50, 50, 50, 50, 50, 50, 50, 50];
+    var baseHue := 180;  // Start with blue
+    var mood := Vibrant;
+    var harmony := Complementary;
+    var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+    Model(baseHue, mood, harmony, colors, (0, 1), 0, 0, 0)
+  }
+
+  // ============================================================================
+  // Color Generation
+  // ============================================================================
+
+  predicate ValidRandomSeeds(seeds: seq<int>) {
+    |seeds| == 10 && (forall i | 0 <= i < 10 :: 0 <= seeds[i] <= 100)
+  }
+
+  // Check if all colors in a sequence satisfy a mood constraint
+  predicate AllColorsSatisfyMood(colors: seq<Color>, mood: Mood)
+    requires |colors| == 5
+  {
+    forall i | 0 <= i < 5 :: ColorSatisfiesMood(colors[i], mood)
+  }
+
+  // Generate a color with given hue using golden ratio S/L distribution
+  function GenerateColorGolden(h: int, mood: Mood, colorIndex: int, seedS: int, seedL: int): Color
+    requires 0 <= h < 360
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (s, l) := GoldenSLForMood(mood, colorIndex, seedS, seedL);
+    Color(h, s, l)
+  }
+
+  // Generate a full 5-color palette using golden ratio S/L distribution
+  function GeneratePaletteColors(baseHue: int, mood: Mood, harmony: Harmony, randomSeeds: seq<int>): seq<Color>
+    requires ValidBaseHue(baseHue)
+    requires ValidRandomSeeds(randomSeeds)
+  {
+    var hues := AllHarmonyHues(baseHue, harmony);
+
+    if |hues| != 5 then
+      // Fallback for Custom harmony: use baseHue for all
+      [GenerateColorGolden(baseHue, mood, 0, randomSeeds[0], randomSeeds[1]),
+       GenerateColorGolden(baseHue, mood, 1, randomSeeds[2], randomSeeds[3]),
+       GenerateColorGolden(baseHue, mood, 2, randomSeeds[4], randomSeeds[5]),
+       GenerateColorGolden(baseHue, mood, 3, randomSeeds[6], randomSeeds[7]),
+       GenerateColorGolden(baseHue, mood, 4, randomSeeds[8], randomSeeds[9])]
+    else
+      [GenerateColorGolden(hues[0], mood, 0, randomSeeds[0], randomSeeds[1]),
+       GenerateColorGolden(hues[1], mood, 1, randomSeeds[2], randomSeeds[3]),
+       GenerateColorGolden(hues[2], mood, 2, randomSeeds[4], randomSeeds[5]),
+       GenerateColorGolden(hues[3], mood, 3, randomSeeds[6], randomSeeds[7]),
+       GenerateColorGolden(hues[4], mood, 4, randomSeeds[8], randomSeeds[9])]
+  }
+
+  // ============================================================================
+  // State Transitions (Apply)
+  // ============================================================================
+
+  function Apply(m: Model, a: Action): Model
+  requires Inv(m)
+  {
+    match a
+    case GeneratePalette(baseHue, mood, harmony, randomSeeds) =>
+      if !ValidBaseHue(baseHue) || !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+        m.(baseHue := baseHue, mood := mood, harmony := harmony, colors := colors,
+           adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case AdjustColor(index, deltaH, deltaS, deltaL) =>
+      if index < 0 || index >= |m.colors| then m
+      else
+        ApplyIndependentAdjustment(m, index, deltaH, deltaS, deltaL)
+
+    // AdjustPalette: Applies linked adjustment to all colors
+    case AdjustPalette(deltaH, deltaS, deltaL) =>
+      var adjusted := ApplyLinkedAdjustment(m, deltaH, deltaS, deltaL);
+      adjusted.(adjustmentH := m.adjustmentH + deltaH,
+                adjustmentS := m.adjustmentS + deltaS,
+                adjustmentL := m.adjustmentL + deltaL)
+
+    case SelectContrastPair(fg, bg) =>
+      if 0 <= fg < 5 && 0 <= bg < 5 then
+        m.(contrastPair := (fg, bg))
+      else m
+
+    case SetColorDirect(index, color) =>
+      if index < 0 || index >= |m.colors| then m
+      else
+        ApplySetColorDirect(m, index, color)
+
+    case RegenerateMood(mood, randomSeeds) =>
+      if !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(m.baseHue, mood, m.harmony, randomSeeds);
+        m.(mood := mood, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case RegenerateHarmony(harmony, randomSeeds) =>
+      if !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(m.baseHue, m.mood, harmony, randomSeeds);
+        m.(harmony := harmony, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case RandomizeBaseHue(newBaseHue, randomSeeds) =>
+      if !ValidBaseHue(newBaseHue) || !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(newBaseHue, m.mood, m.harmony, randomSeeds);
+        m.(baseHue := newBaseHue, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+  }
+
+  // ============================================================================
+  // Linked Adjustment: Shift all colors together
+  // ============================================================================
+
+  function ApplyLinkedAdjustment(m: Model, deltaH: int, deltaS: int, deltaL: int): Model
+    requires |m.colors| == 5
+    requires forall i | 0 <= i < 5 :: ValidColor(m.colors[i])
+  {
+    // Shift baseHue and regenerate harmony hues
+    var newBaseHue := NormalizeHue(m.baseHue + deltaH);
+    var newHues := AllHarmonyHues(newBaseHue, m.harmony);
+
+    // Adjust S and L for all colors, preserving hues
+    var adjustedColors :=
+      if |newHues| == 5 then
+        [AdjustColorSL(m.colors[0], newHues[0], deltaS, deltaL),
+         AdjustColorSL(m.colors[1], newHues[1], deltaS, deltaL),
+         AdjustColorSL(m.colors[2], newHues[2], deltaS, deltaL),
+         AdjustColorSL(m.colors[3], newHues[3], deltaS, deltaL),
+         AdjustColorSL(m.colors[4], newHues[4], deltaS, deltaL)]
+      else (
+        // Custom harmony: shift each color's hue by deltaH, adjust S/L
+        [AdjustColorSL(m.colors[0], NormalizeHue(m.colors[0].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[1], NormalizeHue(m.colors[1].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[2], NormalizeHue(m.colors[2].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[3], NormalizeHue(m.colors[3].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[4], NormalizeHue(m.colors[4].h + deltaH), deltaS, deltaL)]
+      );
+
+    // Check if any color breaks mood bounds
+    var moodBroken := m.mood != Mood.Custom &&
+                      exists i | 0 <= i < 5 :: !ColorSatisfiesMood(adjustedColors[i], m.mood);
+
+    var newMood := if moodBroken then Mood.Custom else m.mood;
+
+    m.(baseHue := newBaseHue, colors := adjustedColors, mood := newMood)
+  }
+
+  // Helper: Adjust a color's S and L while setting a specific hue
+  function AdjustColorSL(c: Color, newHue: int, deltaS: int, deltaL: int): Color
+    requires 0 <= newHue < 360
+  {
+    var newS := Clamp(c.s + deltaS, 0, 100);
+    var newL := Clamp(c.l + deltaL, 0, 100);
+    Color(newHue, newS, newL)
+  }
+
+  // ============================================================================
+  // Independent Adjustment: Adjust only one color
+  // ============================================================================
+
+  function ApplyIndependentAdjustment(m: Model, index: int, deltaH: int, deltaS: int, deltaL: int): Model
+    requires 0 <= index < 5
+    requires |m.colors| == 5
+  {
+    var oldColor := m.colors[index];
+    var newColor := ClampColor(Color(
+      oldColor.h + deltaH,
+      oldColor.s + deltaS,
+      oldColor.l + deltaL
+    ));
+
+    // Check if hue changed and no longer matches harmony
+    var expectedHues := AllHarmonyHues(m.baseHue, m.harmony);
+    var hueChanged := |expectedHues| == 5 && newColor.h != expectedHues[index];
+    var harmonyBroken := m.harmony != Harmony.Custom && hueChanged;
+
+    // Check if mood bounds broken
+    var moodBroken := m.mood != Mood.Custom && !ColorSatisfiesMood(newColor, m.mood);
+
+    var newColors := m.colors[index := newColor];
+    var newHarmony := if harmonyBroken then Harmony.Custom else m.harmony;
+    var newMood := if moodBroken then Mood.Custom else m.mood;
+
+    m.(colors := newColors, harmony := newHarmony, mood := newMood)
+  }
+
+  // ============================================================================
+  // SetColorDirect: Try to preserve mood/harmony when possible
+  // ============================================================================
+
+  function ApplySetColorDirect(m: Model, index: int, color: Color): Model
+    requires 0 <= index < 5
+    requires |m.colors| == 5
+  {
+    var clampedColor := ClampColor(color);
+
+    // Check if new color matches expected harmony hue
+    var expectedHues := AllHarmonyHues(m.baseHue, m.harmony);
+    var hueMatches := |expectedHues| == 5 && clampedColor.h == expectedHues[index];
+    var harmonyPreserved := m.harmony == Harmony.Custom || hueMatches;
+
+    // Check if new color satisfies current mood
+    var moodPreserved := m.mood == Mood.Custom || ColorSatisfiesMood(clampedColor, m.mood);
+
+    var newColors := m.colors[index := clampedColor];
+    var newHarmony := if harmonyPreserved then m.harmony else Harmony.Custom;
+    var newMood := if moodPreserved then m.mood else Mood.Custom;
+
+    m.(colors := newColors, harmony := newHarmony, mood := newMood)
+  }
+
+  // ============================================================================
+  // Normalize: Ensure invariant holds
+  // ============================================================================
+
+  function Normalize(m: Model): Model {
+    // Ensure baseHue is in valid range
+    var normalizedBaseHue := NormalizeHue(m.baseHue);
+
+    // Ensure all colors are valid (clamped)
+    // If we don't have exactly 5 colors, create defaults
+    var normalizedColors :=
+      if |m.colors| == 5 then [
+        ClampColor(m.colors[0]),
+        ClampColor(m.colors[1]),
+        ClampColor(m.colors[2]),
+        ClampColor(m.colors[3]),
+        ClampColor(m.colors[4])
+      ]
+      else [
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0)
+      ];
+
+    // Ensure contrast pair indices are valid
+    var normalizedContrastPair :=
+      if 0 <= m.contrastPair.0 < 5 && 0 <= m.contrastPair.1 < 5 then
+        m.contrastPair
+      else
+        (0, 1);
+
+    // If mood is not Custom, verify all colors satisfy it; otherwise switch to Custom
+    var finalMood :=
+      if m.mood == Mood.Custom then Mood.Custom
+      else if AllColorsSatisfyMood(normalizedColors, m.mood) then m.mood
+      else Mood.Custom;
+
+    // If harmony is not Custom, verify hues match; otherwise switch to Custom
+    var finalHarmony :=
+      if m.harmony == Harmony.Custom then Harmony.Custom
+      else if HuesMatchHarmony(normalizedColors, normalizedBaseHue, m.harmony) then m.harmony
+      else Harmony.Custom;
+
+    m.(
+      baseHue := normalizedBaseHue,
+      colors := normalizedColors,
+      contrastPair := normalizedContrastPair,
+      mood := finalMood,
+      harmony := finalHarmony
+    )
+  }
+}
+
+
+// === End ColorWheelSpec.dfy ===
+// === Inlined from ColorWheelProof.dfy ===
+// === Inlined from ColorWheelSpec.dfy ===
+// ColorWheel Domain Specification
+// A verified color palette generator with mood + harmony constraints
+
+module ColorWheelSpec {
+
+  // ============================================================================
+  // Core Types
+  // ============================================================================
+
+  datatype Color = Color(h: int, s: int, l: int)
+
+  datatype Mood =
+    | Vibrant      // S ≥ 70,  40 ≤ L ≤ 60
+    | SoftMuted    // 20 ≤ S ≤ 45, 55 ≤ L ≤ 75
+    | Pastel       // S ≤ 35,  L ≥ 75
+    | DeepJewel    // S ≥ 60,  25 ≤ L ≤ 45
+    | Earth        // 15 ≤ S ≤ 40, 30 ≤ L ≤ 60
+    | Neon         // S ≥ 90,  50 ≤ L ≤ 65
+    | Custom       // No S/L constraints
+
+  datatype Harmony =
+    | Complementary     // 2 base hues: [H₀, H₀+180°] + 3 variations
+    | Triadic           // 3 base hues: [H₀, H₀+120°, H₀+240°] + 2 variations
+    | Analogous         // 5 hues: [H₀-30°, H₀-15°, H₀, H₀+15°, H₀+30°]
+    | SplitComplement   // 3 base hues: [H₀, H₀+150°, H₀+210°] + 2 variations
+    | Square            // 4 base hues: [H₀, H₀+90°, H₀+180°, H₀+270°] + 1 variation
+    | Custom            // No hue relationship
+
+  datatype Model = Model(
+    baseHue: int,                    // 0-359, the anchor hue
+    mood: Mood,
+    harmony: Harmony,
+    colors: seq<Color>,              // Always exactly 5 colors
+    contrastPair: (int, int),        // (foreground index, background index)
+    // Cumulative palette adjustments (for UI slider display)
+    adjustmentH: int,                // Cumulative hue adjustment
+    adjustmentS: int,                // Cumulative saturation adjustment
+    adjustmentL: int                 // Cumulative lightness adjustment
+  )
+
+  datatype Action =
+    // randomSeeds: 10 values [0-100] for random S/L generation (2 per color)
+    | GeneratePalette(baseHue: int, mood: Mood, harmony: Harmony, randomSeeds: seq<int>)
+    | AdjustColor(index: int, deltaH: int, deltaS: int, deltaL: int)
+    // AdjustPalette: Applies linked adjustment to ALL colors
+    | AdjustPalette(deltaH: int, deltaS: int, deltaL: int)
+    | SelectContrastPair(fg: int, bg: int)
+    | SetColorDirect(index: int, color: Color)
+    // randomSeeds: 10 values for regenerating colors with new mood
+    | RegenerateMood(mood: Mood, randomSeeds: seq<int>)
+    // randomSeeds: 10 values for regenerating colors with new harmony
+    | RegenerateHarmony(harmony: Harmony, randomSeeds: seq<int>)
+    // newBaseHue + randomSeeds: pick new base, regenerate
+    | RandomizeBaseHue(newBaseHue: int, randomSeeds: seq<int>)
+
+  // ============================================================================
+  // Helper Functions
+  // ============================================================================
+
+  function Clamp(x: int, min: int, max: int): int {
+    if x < min then min
+    else if x > max then max
+    else x
+  }
+
+  function NormalizeHue(h: int): int {
+    var normalized := h % 360;
+    if normalized < 0 then normalized + 360 else normalized
+  }
+
+  function ClampColor(c: Color): Color {
+    Color(
+      NormalizeHue(c.h),
+      Clamp(c.s, 0, 100),
+      Clamp(c.l, 0, 100)
+    )
+  }
+
+  // ============================================================================
+  // Mood Predicates
+  // ============================================================================
+
+  predicate ValidColor(c: Color) {
+    0 <= c.h < 360 && 0 <= c.s <= 100 && 0 <= c.l <= 100
+  }
+
+  predicate ValidBaseHue(h: int) {
+    0 <= h < 360
+  }
+
+  predicate ColorSatisfiesMood(c: Color, mood: Mood) {
+    match mood
+    case Vibrant    => c.s >= 70 && 40 <= c.l <= 60
+    case SoftMuted  => 20 <= c.s <= 45 && 55 <= c.l <= 75
+    case Pastel     => c.s <= 35 && c.l >= 75
+    case DeepJewel  => c.s >= 60 && 25 <= c.l <= 45
+    case Earth      => 15 <= c.s <= 40 && 30 <= c.l <= 60
+    case Neon       => c.s >= 90 && 50 <= c.l <= 65
+    case Custom     => true
+  }
+
+  // Returns (minS, maxS, minL, maxL) bounds for a given mood
+  function MoodBounds(mood: Mood): (int, int, int, int) {
+    match mood
+    case Vibrant    => (70, 100, 40, 60)
+    case SoftMuted  => (20, 45, 55, 75)
+    case Pastel     => (0, 35, 75, 100)
+    case DeepJewel  => (60, 100, 25, 45)
+    case Earth      => (15, 40, 30, 60)
+    case Neon       => (90, 100, 50, 65)
+    case Custom     => (0, 100, 0, 100)
+  }
+
+  // Map a random seed [0-100] to a value in [min, max]
+  function RandomInRange(seed: int, min: int, max: int): int
+    requires 0 <= seed <= 100
+    requires min <= max
+  {
+    if min == max then min
+    else min + (seed * (max - min)) / 100
+  }
+
+  // Generate random (S, L) within mood bounds using two random seeds
+  function RandomSLForMood(mood: Mood, seedS: int, seedL: int): (int, int)
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (minS, maxS, minL, maxL) := MoodBounds(mood);
+    (RandomInRange(seedS, minS, maxS), RandomInRange(seedL, minL, maxL))
+  }
+
+  // Golden ratio approximation * 100 = 61.8 ≈ 62
+  // Golden ratio distribution avoids clustering and maximizes visual distinction
+  const GoldenOffset: int := 62
+
+  // Generate (S, L) using golden ratio distribution for maximum variance
+  // Each color's position is offset by golden ratio, ensuring even distribution
+  // and dramatic changes between regenerations
+  function GoldenSLForMood(mood: Mood, colorIndex: int, seedS: int, seedL: int): (int, int)
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (minS, maxS, minL, maxL) := MoodBounds(mood);
+
+    // Golden ratio offset creates mathematically optimal distribution
+    // Using different multipliers for S and L to avoid correlation
+    var spreadS := (seedS + colorIndex * GoldenOffset) % 101;
+    var spreadL := (seedL + colorIndex * 38) % 101;  // 38 ≈ 62 * 0.618 (nested golden)
+
+    (RandomInRange(spreadS, minS, maxS), RandomInRange(spreadL, minL, maxL))
+  }
+
+  // ============================================================================
+  // Harmony Functions
+  // ============================================================================
+
+  // Returns the base harmony hues (before padding to 5)
+  function BaseHarmonyHues(baseHue: int, harmony: Harmony): seq<int> {
+    match harmony
+    case Complementary   => [baseHue, NormalizeHue(baseHue + 180)]
+    case Triadic         => [baseHue, NormalizeHue(baseHue + 120), NormalizeHue(baseHue + 240)]
+    case Analogous       => [NormalizeHue(baseHue - 30), NormalizeHue(baseHue - 15),
+                             baseHue, NormalizeHue(baseHue + 15), NormalizeHue(baseHue + 30)]
+    case SplitComplement => [baseHue, NormalizeHue(baseHue + 150), NormalizeHue(baseHue + 210)]
+    case Square          => [baseHue, NormalizeHue(baseHue + 90),
+                             NormalizeHue(baseHue + 180), NormalizeHue(baseHue + 270)]
+    case Custom          => [] // No constraint
+  }
+
+  // Hue spread offset for creating variation in repeated hues
+  // 35° provides better visual distinction than 20° while staying within harmony "feel"
+  const HueSpread: int := 35
+
+  // Returns all 5 hues for a harmony (with spreading for variety)
+  // Instead of repeating exact hues, we spread them by ±HueSpread degrees
+  function AllHarmonyHues(baseHue: int, harmony: Harmony): seq<int> {
+    var base := BaseHarmonyHues(baseHue, harmony);
+    if harmony == Harmony.Custom then []
+    else if |base| == 5 then base  // Analogous: already 5 distinct hues
+    else if |base| == 4 then
+      // Square: add midpoint between first two hues
+      base + [NormalizeHue(baseHue + 45)]
+    else if |base| == 3 then
+      // Triadic/Split: spread the first two base hues
+      base + [NormalizeHue(base[0] + HueSpread), NormalizeHue(base[1] - HueSpread)]
+    else if |base| == 2 then
+      // Complementary: spread both base hues
+      base + [NormalizeHue(base[0] + HueSpread),
+              NormalizeHue(base[1] + HueSpread),
+              NormalizeHue(base[0] - HueSpread)]
+    else []
+  }
+
+  // Check if a color palette's hues match the expected harmony pattern
+  predicate HuesMatchHarmony(colors: seq<Color>, baseHue: int, harmony: Harmony) {
+    if harmony == Harmony.Custom then true
+    else
+      var expectedHues := AllHarmonyHues(baseHue, harmony);
+      |colors| == 5 && |expectedHues| == 5 &&
+      forall i | 0 <= i < 5 :: colors[i].h == expectedHues[i]
+  }
+
+  // ============================================================================
+  // Main Invariant
+  // ============================================================================
+
+  predicate Inv(m: Model) {
+    && ValidBaseHue(m.baseHue)
+    && |m.colors| == 5
+    && (forall i | 0 <= i < 5 :: ValidColor(m.colors[i]))
+    && 0 <= m.contrastPair.0 < 5
+    && 0 <= m.contrastPair.1 < 5
+    // Mood constraint: all colors satisfy mood (unless Custom)
+    && (m.mood != Mood.Custom ==>
+          forall i | 0 <= i < 5 :: ColorSatisfiesMood(m.colors[i], m.mood))
+    // Harmony constraint: hues follow harmony pattern (unless Custom)
+    && HuesMatchHarmony(m.colors, m.baseHue, m.harmony)
+  }
+
+  // ============================================================================
+  // Initial State
+  // ============================================================================
+
+  function Init(): Model {
+    var randomSeeds := [50, 50, 50, 50, 50, 50, 50, 50, 50, 50];
+    var baseHue := 180;  // Start with blue
+    var mood := Vibrant;
+    var harmony := Complementary;
+    var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+    Model(baseHue, mood, harmony, colors, (0, 1), 0, 0, 0)
+  }
+
+  // ============================================================================
+  // Color Generation
+  // ============================================================================
+
+  predicate ValidRandomSeeds(seeds: seq<int>) {
+    |seeds| == 10 && (forall i | 0 <= i < 10 :: 0 <= seeds[i] <= 100)
+  }
+
+  // Check if all colors in a sequence satisfy a mood constraint
+  predicate AllColorsSatisfyMood(colors: seq<Color>, mood: Mood)
+    requires |colors| == 5
+  {
+    forall i | 0 <= i < 5 :: ColorSatisfiesMood(colors[i], mood)
+  }
+
+  // Generate a color with given hue using golden ratio S/L distribution
+  function GenerateColorGolden(h: int, mood: Mood, colorIndex: int, seedS: int, seedL: int): Color
+    requires 0 <= h < 360
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+  {
+    var (s, l) := GoldenSLForMood(mood, colorIndex, seedS, seedL);
+    Color(h, s, l)
+  }
+
+  // Generate a full 5-color palette using golden ratio S/L distribution
+  function GeneratePaletteColors(baseHue: int, mood: Mood, harmony: Harmony, randomSeeds: seq<int>): seq<Color>
+    requires ValidBaseHue(baseHue)
+    requires ValidRandomSeeds(randomSeeds)
+  {
+    var hues := AllHarmonyHues(baseHue, harmony);
+
+    if |hues| != 5 then
+      // Fallback for Custom harmony: use baseHue for all
+      [GenerateColorGolden(baseHue, mood, 0, randomSeeds[0], randomSeeds[1]),
+       GenerateColorGolden(baseHue, mood, 1, randomSeeds[2], randomSeeds[3]),
+       GenerateColorGolden(baseHue, mood, 2, randomSeeds[4], randomSeeds[5]),
+       GenerateColorGolden(baseHue, mood, 3, randomSeeds[6], randomSeeds[7]),
+       GenerateColorGolden(baseHue, mood, 4, randomSeeds[8], randomSeeds[9])]
+    else
+      [GenerateColorGolden(hues[0], mood, 0, randomSeeds[0], randomSeeds[1]),
+       GenerateColorGolden(hues[1], mood, 1, randomSeeds[2], randomSeeds[3]),
+       GenerateColorGolden(hues[2], mood, 2, randomSeeds[4], randomSeeds[5]),
+       GenerateColorGolden(hues[3], mood, 3, randomSeeds[6], randomSeeds[7]),
+       GenerateColorGolden(hues[4], mood, 4, randomSeeds[8], randomSeeds[9])]
+  }
+
+  // ============================================================================
+  // State Transitions (Apply)
+  // ============================================================================
+
+  function Apply(m: Model, a: Action): Model
+  requires Inv(m)
+  {
+    match a
+    case GeneratePalette(baseHue, mood, harmony, randomSeeds) =>
+      if !ValidBaseHue(baseHue) || !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+        m.(baseHue := baseHue, mood := mood, harmony := harmony, colors := colors,
+           adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case AdjustColor(index, deltaH, deltaS, deltaL) =>
+      if index < 0 || index >= |m.colors| then m
+      else
+        ApplyIndependentAdjustment(m, index, deltaH, deltaS, deltaL)
+
+    // AdjustPalette: Applies linked adjustment to all colors
+    case AdjustPalette(deltaH, deltaS, deltaL) =>
+      var adjusted := ApplyLinkedAdjustment(m, deltaH, deltaS, deltaL);
+      adjusted.(adjustmentH := m.adjustmentH + deltaH,
+                adjustmentS := m.adjustmentS + deltaS,
+                adjustmentL := m.adjustmentL + deltaL)
+
+    case SelectContrastPair(fg, bg) =>
+      if 0 <= fg < 5 && 0 <= bg < 5 then
+        m.(contrastPair := (fg, bg))
+      else m
+
+    case SetColorDirect(index, color) =>
+      if index < 0 || index >= |m.colors| then m
+      else
+        ApplySetColorDirect(m, index, color)
+
+    case RegenerateMood(mood, randomSeeds) =>
+      if !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(m.baseHue, mood, m.harmony, randomSeeds);
+        m.(mood := mood, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case RegenerateHarmony(harmony, randomSeeds) =>
+      if !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(m.baseHue, m.mood, harmony, randomSeeds);
+        m.(harmony := harmony, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+
+    case RandomizeBaseHue(newBaseHue, randomSeeds) =>
+      if !ValidBaseHue(newBaseHue) || !ValidRandomSeeds(randomSeeds) then m
+      else
+        var colors := GeneratePaletteColors(newBaseHue, m.mood, m.harmony, randomSeeds);
+        m.(baseHue := newBaseHue, colors := colors, adjustmentH := 0, adjustmentS := 0, adjustmentL := 0)
+  }
+
+  // ============================================================================
+  // Linked Adjustment: Shift all colors together
+  // ============================================================================
+
+  function ApplyLinkedAdjustment(m: Model, deltaH: int, deltaS: int, deltaL: int): Model
+    requires |m.colors| == 5
+    requires forall i | 0 <= i < 5 :: ValidColor(m.colors[i])
+  {
+    // Shift baseHue and regenerate harmony hues
+    var newBaseHue := NormalizeHue(m.baseHue + deltaH);
+    var newHues := AllHarmonyHues(newBaseHue, m.harmony);
+
+    // Adjust S and L for all colors, preserving hues
+    var adjustedColors :=
+      if |newHues| == 5 then
+        [AdjustColorSL(m.colors[0], newHues[0], deltaS, deltaL),
+         AdjustColorSL(m.colors[1], newHues[1], deltaS, deltaL),
+         AdjustColorSL(m.colors[2], newHues[2], deltaS, deltaL),
+         AdjustColorSL(m.colors[3], newHues[3], deltaS, deltaL),
+         AdjustColorSL(m.colors[4], newHues[4], deltaS, deltaL)]
+      else (
+        // Custom harmony: shift each color's hue by deltaH, adjust S/L
+        [AdjustColorSL(m.colors[0], NormalizeHue(m.colors[0].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[1], NormalizeHue(m.colors[1].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[2], NormalizeHue(m.colors[2].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[3], NormalizeHue(m.colors[3].h + deltaH), deltaS, deltaL),
+         AdjustColorSL(m.colors[4], NormalizeHue(m.colors[4].h + deltaH), deltaS, deltaL)]
+      );
+
+    // Check if any color breaks mood bounds
+    var moodBroken := m.mood != Mood.Custom &&
+                      exists i | 0 <= i < 5 :: !ColorSatisfiesMood(adjustedColors[i], m.mood);
+
+    var newMood := if moodBroken then Mood.Custom else m.mood;
+
+    m.(baseHue := newBaseHue, colors := adjustedColors, mood := newMood)
+  }
+
+  // Helper: Adjust a color's S and L while setting a specific hue
+  function AdjustColorSL(c: Color, newHue: int, deltaS: int, deltaL: int): Color
+    requires 0 <= newHue < 360
+  {
+    var newS := Clamp(c.s + deltaS, 0, 100);
+    var newL := Clamp(c.l + deltaL, 0, 100);
+    Color(newHue, newS, newL)
+  }
+
+  // ============================================================================
+  // Independent Adjustment: Adjust only one color
+  // ============================================================================
+
+  function ApplyIndependentAdjustment(m: Model, index: int, deltaH: int, deltaS: int, deltaL: int): Model
+    requires 0 <= index < 5
+    requires |m.colors| == 5
+  {
+    var oldColor := m.colors[index];
+    var newColor := ClampColor(Color(
+      oldColor.h + deltaH,
+      oldColor.s + deltaS,
+      oldColor.l + deltaL
+    ));
+
+    // Check if hue changed and no longer matches harmony
+    var expectedHues := AllHarmonyHues(m.baseHue, m.harmony);
+    var hueChanged := |expectedHues| == 5 && newColor.h != expectedHues[index];
+    var harmonyBroken := m.harmony != Harmony.Custom && hueChanged;
+
+    // Check if mood bounds broken
+    var moodBroken := m.mood != Mood.Custom && !ColorSatisfiesMood(newColor, m.mood);
+
+    var newColors := m.colors[index := newColor];
+    var newHarmony := if harmonyBroken then Harmony.Custom else m.harmony;
+    var newMood := if moodBroken then Mood.Custom else m.mood;
+
+    m.(colors := newColors, harmony := newHarmony, mood := newMood)
+  }
+
+  // ============================================================================
+  // SetColorDirect: Try to preserve mood/harmony when possible
+  // ============================================================================
+
+  function ApplySetColorDirect(m: Model, index: int, color: Color): Model
+    requires 0 <= index < 5
+    requires |m.colors| == 5
+  {
+    var clampedColor := ClampColor(color);
+
+    // Check if new color matches expected harmony hue
+    var expectedHues := AllHarmonyHues(m.baseHue, m.harmony);
+    var hueMatches := |expectedHues| == 5 && clampedColor.h == expectedHues[index];
+    var harmonyPreserved := m.harmony == Harmony.Custom || hueMatches;
+
+    // Check if new color satisfies current mood
+    var moodPreserved := m.mood == Mood.Custom || ColorSatisfiesMood(clampedColor, m.mood);
+
+    var newColors := m.colors[index := clampedColor];
+    var newHarmony := if harmonyPreserved then m.harmony else Harmony.Custom;
+    var newMood := if moodPreserved then m.mood else Mood.Custom;
+
+    m.(colors := newColors, harmony := newHarmony, mood := newMood)
+  }
+
+  // ============================================================================
+  // Normalize: Ensure invariant holds
+  // ============================================================================
+
+  function Normalize(m: Model): Model {
+    // Ensure baseHue is in valid range
+    var normalizedBaseHue := NormalizeHue(m.baseHue);
+
+    // Ensure all colors are valid (clamped)
+    // If we don't have exactly 5 colors, create defaults
+    var normalizedColors :=
+      if |m.colors| == 5 then [
+        ClampColor(m.colors[0]),
+        ClampColor(m.colors[1]),
+        ClampColor(m.colors[2]),
+        ClampColor(m.colors[3]),
+        ClampColor(m.colors[4])
+      ]
+      else [
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0),
+        Color(0, 0, 0)
+      ];
+
+    // Ensure contrast pair indices are valid
+    var normalizedContrastPair :=
+      if 0 <= m.contrastPair.0 < 5 && 0 <= m.contrastPair.1 < 5 then
+        m.contrastPair
+      else
+        (0, 1);
+
+    // If mood is not Custom, verify all colors satisfy it; otherwise switch to Custom
+    var finalMood :=
+      if m.mood == Mood.Custom then Mood.Custom
+      else if AllColorsSatisfyMood(normalizedColors, m.mood) then m.mood
+      else Mood.Custom;
+
+    // If harmony is not Custom, verify hues match; otherwise switch to Custom
+    var finalHarmony :=
+      if m.harmony == Harmony.Custom then Harmony.Custom
+      else if HuesMatchHarmony(normalizedColors, normalizedBaseHue, m.harmony) then m.harmony
+      else Harmony.Custom;
+
+    m.(
+      baseHue := normalizedBaseHue,
+      colors := normalizedColors,
+      contrastPair := normalizedContrastPair,
+      mood := finalMood,
+      harmony := finalHarmony
+    )
+  }
+}
+
+// === End ColorWheelSpec.dfy ===
+
+module ColorWheelProof {
+  import opened CWSpec = ColorWheelSpec
+
+  lemma InitSatisfiesInv()
+    ensures Inv(Init())
+  {
+  }
+
+  // Helper lemma: GeneratePaletteColors produces colors satisfying mood
+  lemma GeneratePaletteColorsValid(baseHue: int, mood: Mood, harmony: Harmony, randomSeeds: seq<int>)
+    requires ValidBaseHue(baseHue)
+    requires ValidRandomSeeds(randomSeeds)
+    ensures var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+            |colors| == 5 &&
+            (forall i | 0 <= i < 5 :: ValidColor(colors[i])) &&
+            (mood != Mood.Custom ==> forall i | 0 <= i < 5 :: ColorSatisfiesMood(colors[i], mood)) &&
+            HuesMatchHarmony(colors, baseHue, harmony)
+  {
+    var colors := GeneratePaletteColors(baseHue, mood, harmony, randomSeeds);
+    var hues := AllHarmonyHues(baseHue, harmony);
+
+    // Prove each color is valid and satisfies mood
+    forall i | 0 <= i < 5
+      ensures ValidColor(colors[i])
+      ensures mood != Mood.Custom ==> ColorSatisfiesMood(colors[i], mood)
+    {
+      GenerateColorGoldenValid(
+        if |hues| == 5 then hues[i] else baseHue,
+        mood,
+        i,
+        randomSeeds[2*i],
+        randomSeeds[2*i + 1]
+      );
+    }
+
+    // Prove hues match harmony
+    if harmony != Harmony.Custom && |hues| == 5 {
+      assert forall i | 0 <= i < 5 :: colors[i].h == hues[i];
+    }
+  }
+
+  // Helper lemma: GenerateColorGolden produces a valid color satisfying mood
+  lemma GenerateColorGoldenValid(h: int, mood: Mood, colorIndex: int, seedS: int, seedL: int)
+    requires 0 <= h < 360
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+    ensures ValidColor(GenerateColorGolden(h, mood, colorIndex, seedS, seedL))
+    ensures mood != Mood.Custom ==> ColorSatisfiesMood(GenerateColorGolden(h, mood, colorIndex, seedS, seedL), mood)
+  {
+  }
+
+  // Helper lemma: GoldenSLForMood produces values within mood bounds
+  lemma GoldenSLForMoodValid(mood: Mood, colorIndex: int, seedS: int, seedL: int)
+    requires 0 <= colorIndex < 5
+    requires 0 <= seedS <= 100
+    requires 0 <= seedL <= 100
+    ensures var (s, l) := GoldenSLForMood(mood, colorIndex, seedS, seedL);
+            0 <= s <= 100 && 0 <= l <= 100 &&
+            (mood != Mood.Custom ==> ColorSatisfiesMood(Color(0, s, l), mood))
+  {
+    var (minS, maxS, minL, maxL) := MoodBounds(mood);
+    var spreadS := (seedS + colorIndex * GoldenOffset) % 101;
+    var spreadL := (seedL + colorIndex * 38) % 101;
+    var s := RandomInRange(spreadS, minS, maxS);
+    var l := RandomInRange(spreadL, minL, maxL);
+
+    // RandomInRange produces values in [min, max]
+    RandomInRangeValid(spreadS, minS, maxS);
+    RandomInRangeValid(spreadL, minL, maxL);
+  }
+
+  // Helper lemma: RandomInRange produces values in [min, max]
+  lemma RandomInRangeValid(seed: int, min: int, max: int)
+    requires 0 <= seed <= 100
+    requires min <= max
+    ensures min <= RandomInRange(seed, min, max) <= max
+  {
+  }
+
+  lemma StepPreservesInv(m: Model, a: Action)
+  requires Inv(m)
+  ensures Inv(Normalize(Apply(m, a)))
+  {
+  }
+
+  // Helper lemma: NormalizeHue produces a valid hue in [0, 360)
+  lemma NormalizeHueValid(h: int)
+  ensures 0 <= NormalizeHue(h) < 360
+  {
+  }
+
+  lemma NormalizeEnsuresValidBaseHue(m: Model)
+  ensures ValidBaseHue(Normalize(m).baseHue)
+  {
+  }
+
+  lemma NormalizeEnsuresColorCount(m: Model)
+  ensures |Normalize(m).colors| == 5
+  {
+  }
+
+  lemma ClampColorValid(c: Color)
+  ensures ValidColor(ClampColor(c))
+  {
+  }
+
+  lemma NormalizeEnsuresValidColors(m: Model)
+  ensures forall i | 0 <= i < 5 :: ValidColor(Normalize(m).colors[i])
+  {
+  }
+
+  lemma NormalizeEnsuresValidContrastPair(m: Model)
+  ensures 0 <= Normalize(m).contrastPair.0 < 5
+  ensures 0 <= Normalize(m).contrastPair.1 < 5
+  {
+  }
+
+  // Compute normalizedColors as done in Normalize
+  function NormalizedColors(m: Model): seq<Color> {
+    if |m.colors| == 5 then [
+      ClampColor(m.colors[0]),
+      ClampColor(m.colors[1]),
+      ClampColor(m.colors[2]),
+      ClampColor(m.colors[3]),
+      ClampColor(m.colors[4])
+    ]
+    else [
+      Color(0, 0, 0),
+      Color(0, 0, 0),
+      Color(0, 0, 0),
+      Color(0, 0, 0),
+      Color(0, 0, 0)
+    ]
+  }
+
+  // Key helper: Normalize(m).colors == NormalizedColors(m)
+  lemma NormalizeColorsEquality(m: Model)
+  ensures Normalize(m).colors == NormalizedColors(m)
+  {
+  }
+
+  // Key lemma: if Normalize(m).mood != Custom, then the check on colors passed
+  lemma NormalizeMoodImpliesCheck(m: Model)
+  requires Normalize(m).mood != Mood.Custom
+  ensures m.mood != Mood.Custom
+  ensures Normalize(m).mood == m.mood
+  ensures AllColorsSatisfyMood(NormalizedColors(m), m.mood)
+  {
+  }
+
+  lemma NormalizeEnsuresMoodConstraint(m: Model)
+  ensures Normalize(m).mood != Mood.Custom ==>
+          forall i | 0 <= i < 5 :: ColorSatisfiesMood(Normalize(m).colors[i], Normalize(m).mood)
+  {
+  }
+
+  lemma NormalizeEnsuresHarmonyConstraint(m: Model)
+  ensures HuesMatchHarmony(Normalize(m).colors, Normalize(m).baseHue, Normalize(m).harmony)
+  {
+  }
+
+  // ============================================================================
+  // Behavioral Property: AdjustPalette shifts all hues by deltaH
+  // This lemma would have caught the bug where Custom harmony didn't shift hues
+  // ============================================================================
+
+  lemma AdjustPaletteShiftsHues(m: Model, deltaH: int, deltaS: int, deltaL: int)
+    requires Inv(m)
+    ensures var m' := Apply(m, AdjustPalette(deltaH, deltaS, deltaL));
+            forall i | 0 <= i < 5 ::
+              m'.colors[i].h == NormalizeHue(m.colors[i].h + deltaH)
+  {
+    var m' := Apply(m, AdjustPalette(deltaH, deltaS, deltaL));
+    var newBaseHue := NormalizeHue(m.baseHue + deltaH);
+    var newHues := AllHarmonyHues(newBaseHue, m.harmony);
+
+    if |newHues| == 5 {
+      // Non-Custom harmony: hues come from harmony pattern
+      // The harmony hues are shifted versions of the original harmony hues
+      AdjustPaletteShiftsHuesHarmony(m, deltaH, deltaS, deltaL);
+    } else {
+      // Custom harmony: each hue is shifted individually
+      // This is the case that was broken before the fix
+      forall i | 0 <= i < 5
+        ensures m'.colors[i].h == NormalizeHue(m.colors[i].h + deltaH)
+      {
+        NormalizeHueValid(m.colors[i].h + deltaH);
+      }
+    }
+  }
+
+  // Helper: For non-Custom harmony, shifted harmony hues equal original hues + deltaH
+  lemma AdjustPaletteShiftsHuesHarmony(m: Model, deltaH: int, deltaS: int, deltaL: int)
+    requires Inv(m)
+    requires |AllHarmonyHues(NormalizeHue(m.baseHue + deltaH), m.harmony)| == 5
+    ensures var m' := Apply(m, AdjustPalette(deltaH, deltaS, deltaL));
+            forall i | 0 <= i < 5 ::
+              m'.colors[i].h == NormalizeHue(m.colors[i].h + deltaH)
+  {
+    var newBaseHue := NormalizeHue(m.baseHue + deltaH);
+    var oldHues := AllHarmonyHues(m.baseHue, m.harmony);
+    var newHues := AllHarmonyHues(newBaseHue, m.harmony);
+
+    // Key insight: harmony hues are computed from baseHue
+    // So newHues[i] = NormalizeHue(oldHues[i] + deltaH) for each i
+    HarmonyHuesShift(m.baseHue, m.harmony, deltaH);
+
+    // Since Inv(m) holds, m.colors[i].h == oldHues[i] (from HuesMatchHarmony)
+    assert HuesMatchHarmony(m.colors, m.baseHue, m.harmony);
+  }
+
+  // Helper: Shifting baseHue shifts all harmony hues by the same amount
+  lemma HarmonyHuesShift(baseHue: int, harmony: Harmony, deltaH: int)
+    requires 0 <= baseHue < 360
+    requires harmony != Harmony.Custom
+    requires |AllHarmonyHues(baseHue, harmony)| == 5
+    ensures var oldHues := AllHarmonyHues(baseHue, harmony);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), harmony);
+            |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    var oldHues := AllHarmonyHues(baseHue, harmony);
+    var newHues := AllHarmonyHues(newBaseHue, harmony);
+
+    // Each harmony type shifts all hues uniformly
+    match harmony {
+      case Complementary =>
+        HarmonyHuesShiftComplementary(baseHue, deltaH);
+      case Triadic =>
+        HarmonyHuesShiftTriadic(baseHue, deltaH);
+      case Analogous =>
+        HarmonyHuesShiftAnalogous(baseHue, deltaH);
+      case SplitComplement =>
+        HarmonyHuesShiftSplitComplement(baseHue, deltaH);
+      case Square =>
+        HarmonyHuesShiftSquare(baseHue, deltaH);
+      case Custom =>
+        // Unreachable due to requires
+    }
+  }
+
+  lemma HarmonyHuesShiftComplementary(baseHue: int, deltaH: int)
+    requires 0 <= baseHue < 360
+    ensures var oldHues := AllHarmonyHues(baseHue, Complementary);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), Complementary);
+            |oldHues| == 5 && |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    NormalizeHueShiftLemma(baseHue, deltaH);
+    NormalizeHueShiftLemma(baseHue + 180, deltaH);
+    NormalizeHueShiftLemma(baseHue + HueSpread, deltaH);
+    NormalizeHueShiftLemma(baseHue + 180 + HueSpread, deltaH);
+    NormalizeHueShiftLemma(baseHue - HueSpread, deltaH);
+  }
+
+  lemma HarmonyHuesShiftTriadic(baseHue: int, deltaH: int)
+    requires 0 <= baseHue < 360
+    ensures var oldHues := AllHarmonyHues(baseHue, Triadic);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), Triadic);
+            |oldHues| == 5 && |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    NormalizeHueShiftLemma(baseHue, deltaH);
+    NormalizeHueShiftLemma(baseHue + 120, deltaH);
+    NormalizeHueShiftLemma(baseHue + 240, deltaH);
+    NormalizeHueShiftLemma(baseHue + HueSpread, deltaH);
+    NormalizeHueShiftLemma(baseHue + 120 - HueSpread, deltaH);
+  }
+
+  lemma HarmonyHuesShiftAnalogous(baseHue: int, deltaH: int)
+    requires 0 <= baseHue < 360
+    ensures var oldHues := AllHarmonyHues(baseHue, Analogous);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), Analogous);
+            |oldHues| == 5 && |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    NormalizeHueShiftLemma(baseHue - 30, deltaH);
+    NormalizeHueShiftLemma(baseHue - 15, deltaH);
+    NormalizeHueShiftLemma(baseHue, deltaH);
+    NormalizeHueShiftLemma(baseHue + 15, deltaH);
+    NormalizeHueShiftLemma(baseHue + 30, deltaH);
+  }
+
+  lemma HarmonyHuesShiftSplitComplement(baseHue: int, deltaH: int)
+    requires 0 <= baseHue < 360
+    ensures var oldHues := AllHarmonyHues(baseHue, SplitComplement);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), SplitComplement);
+            |oldHues| == 5 && |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    NormalizeHueShiftLemma(baseHue, deltaH);
+    NormalizeHueShiftLemma(baseHue + 150, deltaH);
+    NormalizeHueShiftLemma(baseHue + 210, deltaH);
+    NormalizeHueShiftLemma(baseHue + HueSpread, deltaH);
+    NormalizeHueShiftLemma(baseHue + 150 - HueSpread, deltaH);
+  }
+
+  lemma HarmonyHuesShiftSquare(baseHue: int, deltaH: int)
+    requires 0 <= baseHue < 360
+    ensures var oldHues := AllHarmonyHues(baseHue, Square);
+            var newHues := AllHarmonyHues(NormalizeHue(baseHue + deltaH), Square);
+            |oldHues| == 5 && |newHues| == 5 &&
+            forall i | 0 <= i < 5 :: newHues[i] == NormalizeHue(oldHues[i] + deltaH)
+  {
+    var newBaseHue := NormalizeHue(baseHue + deltaH);
+    NormalizeHueShiftLemma(baseHue, deltaH);
+    NormalizeHueShiftLemma(baseHue + 90, deltaH);
+    NormalizeHueShiftLemma(baseHue + 180, deltaH);
+    NormalizeHueShiftLemma(baseHue + 270, deltaH);
+    NormalizeHueShiftLemma(baseHue + 45, deltaH);
+  }
+
+  // Key arithmetic lemma: NormalizeHue(NormalizeHue(a) + b) == NormalizeHue(a + b)
+  lemma NormalizeHueShiftLemma(a: int, b: int)
+    ensures NormalizeHue(NormalizeHue(a) + b) == NormalizeHue(a + b)
+  {
+  }
+
+  // Helper: NormalizeHue(x) ≡ x (mod 360)
+  lemma NormalizeHueModEquiv(x: int, nx: int)
+    requires nx == NormalizeHue(x)
+    ensures (nx - x) % 360 == 0
+  {
+  }
+}
+
+// === End ColorWheelProof.dfy ===
+
+module ColorWheelProps {
+  import opened ColorWheelSpec
+  import ColorWheelProof
+
+  // ============================================================================
+  // Step function (Normalize ∘ Apply) - the actual state transition
+  // ============================================================================
+
+  function Step(m: Model, a: Action): Model
+    requires Inv(m)
+  {
+    Normalize(Apply(m, a))
+  }
+
+  lemma StepPreservesInv(m: Model, a: Action)
+    requires Inv(m)
+    ensures Inv(Step(m, a))
+  {
+  }
+
+  // ============================================================================
+  // Commutativity Properties (using Step for proper invariant preservation)
+  // ============================================================================
+
+  // SelectContrastPair only modifies contrastPair, so it commutes with
+  // any action that doesn't modify contrastPair
+
+  lemma SelectContrastPairCommutesWithAdjustColor(
+    m: Model, fg: int, bg: int, idx: int, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    requires 0 <= fg < 5 && 0 <= bg < 5
+    ensures Step(Step(m, SelectContrastPair(fg, bg)), AdjustColor(idx, dH, dS, dL))
+         == Step(Step(m, AdjustColor(idx, dH, dS, dL)), SelectContrastPair(fg, bg))
+  {
+  }
+
+  lemma SelectContrastPairCommutesWithAdjustPalette(
+    m: Model, fg: int, bg: int, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    requires 0 <= fg < 5 && 0 <= bg < 5
+    ensures Step(Step(m, SelectContrastPair(fg, bg)), AdjustPalette(dH, dS, dL))
+         == Step(Step(m, AdjustPalette(dH, dS, dL)), SelectContrastPair(fg, bg))
+  {
+  }
+
+  lemma SelectContrastPairCommutesWithSetColorDirect(
+    m: Model, fg: int, bg: int, idx: int, c: Color)
+    requires Inv(m)
+    requires 0 <= fg < 5 && 0 <= bg < 5
+    ensures Step(Step(m, SelectContrastPair(fg, bg)), SetColorDirect(idx, c))
+         == Step(Step(m, SetColorDirect(idx, c)), SelectContrastPair(fg, bg))
+  {
+  }
+
+  // SelectContrastPair is idempotent
+  lemma SelectContrastPairIdempotent(m: Model, fg: int, bg: int)
+    requires Inv(m)
+    requires 0 <= fg < 5 && 0 <= bg < 5
+    ensures Step(Step(m, SelectContrastPair(fg, bg)), SelectContrastPair(fg, bg))
+         == Step(m, SelectContrastPair(fg, bg))
+  {
+  }
+
+  // ============================================================================
+  // AdjustColor on different indices commutes
+  // ============================================================================
+
+  // Key insight: mood/harmony degradation to Custom is monotonic
+  // Once Custom, stays Custom - so order doesn't affect final state
+
+  lemma AdjustColorCommutes(
+    m: Model, i: int, j: int,
+    dH1: int, dS1: int, dL1: int,
+    dH2: int, dS2: int, dL2: int)
+    requires Inv(m)
+    requires 0 <= i < 5 && 0 <= j < 5 && i != j
+    ensures Step(Step(m, AdjustColor(i, dH1, dS1, dL1)), AdjustColor(j, dH2, dS2, dL2))
+         == Step(Step(m, AdjustColor(j, dH2, dS2, dL2)), AdjustColor(i, dH1, dS1, dL1))
+  {
+  }
+
+  // Helper: Colors at different indices are set independently
+  lemma AdjustColorIndependentColors(
+    m: Model, i: int, j: int,
+    dH1: int, dS1: int, dL1: int,
+    dH2: int, dS2: int, dL2: int)
+    requires Inv(m)
+    requires 0 <= i < 5 && 0 <= j < 5 && i != j
+    ensures var m_ij := Step(Step(m, AdjustColor(i, dH1, dS1, dL1)), AdjustColor(j, dH2, dS2, dL2));
+            var m_ji := Step(Step(m, AdjustColor(j, dH2, dS2, dL2)), AdjustColor(i, dH1, dS1, dL1));
+            m_ij.colors == m_ji.colors
+  {
+    StepPreservesInv(m, AdjustColor(i, dH1, dS1, dL1));
+    StepPreservesInv(m, AdjustColor(j, dH2, dS2, dL2));
+
+    var a_i := AdjustColor(i, dH1, dS1, dL1);
+    var a_j := AdjustColor(j, dH2, dS2, dL2);
+
+    // Color at index i after a_i
+    var newColor_i := ClampColor(Color(
+      m.colors[i].h + dH1,
+      m.colors[i].s + dS1,
+      m.colors[i].l + dL1
+    ));
+
+    // Color at index j after a_j
+    var newColor_j := ClampColor(Color(
+      m.colors[j].h + dH2,
+      m.colors[j].s + dS2,
+      m.colors[j].l + dL2
+    ));
+
+    // Path i then j: colors[i] = newColor_i, colors[j] = newColor_j
+    // Path j then i: colors[j] = newColor_j, colors[i] = newColor_i
+    // Same result since i != j
+  }
+
+  // Helper: Mood degradation is symmetric - both paths yield same final mood
+  lemma AdjustColorMoodMonotonic(
+    m: Model, i: int, j: int,
+    dH1: int, dS1: int, dL1: int,
+    dH2: int, dS2: int, dL2: int)
+    requires Inv(m)
+    requires 0 <= i < 5 && 0 <= j < 5 && i != j
+    ensures var m_ij := Step(Step(m, AdjustColor(i, dH1, dS1, dL1)), AdjustColor(j, dH2, dS2, dL2));
+            var m_ji := Step(Step(m, AdjustColor(j, dH2, dS2, dL2)), AdjustColor(i, dH1, dS1, dL1));
+            m_ij.mood == m_ji.mood
+  {
+    StepPreservesInv(m, AdjustColor(i, dH1, dS1, dL1));
+    StepPreservesInv(m, AdjustColor(j, dH2, dS2, dL2));
+
+    var newColor_i := ClampColor(Color(
+      m.colors[i].h + dH1, m.colors[i].s + dS1, m.colors[i].l + dL1));
+    var newColor_j := ClampColor(Color(
+      m.colors[j].h + dH2, m.colors[j].s + dS2, m.colors[j].l + dL2));
+
+    var breaks_i := m.mood != Mood.Custom && !ColorSatisfiesMood(newColor_i, m.mood);
+    var breaks_j := m.mood != Mood.Custom && !ColorSatisfiesMood(newColor_j, m.mood);
+
+    // Case analysis: degradation to Custom is monotonic
+    // Both paths end up with same mood
+  }
+
+  // Helper: Harmony degradation is symmetric
+  lemma AdjustColorHarmonyMonotonic(
+    m: Model, i: int, j: int,
+    dH1: int, dS1: int, dL1: int,
+    dH2: int, dS2: int, dL2: int)
+    requires Inv(m)
+    requires 0 <= i < 5 && 0 <= j < 5 && i != j
+    ensures var m_ij := Step(Step(m, AdjustColor(i, dH1, dS1, dL1)), AdjustColor(j, dH2, dS2, dL2));
+            var m_ji := Step(Step(m, AdjustColor(j, dH2, dS2, dL2)), AdjustColor(i, dH1, dS1, dL1));
+            m_ij.harmony == m_ji.harmony
+  {
+    StepPreservesInv(m, AdjustColor(i, dH1, dS1, dL1));
+    StepPreservesInv(m, AdjustColor(j, dH2, dS2, dL2));
+
+    var newColor_i := ClampColor(Color(
+      m.colors[i].h + dH1, m.colors[i].s + dS1, m.colors[i].l + dL1));
+    var newColor_j := ClampColor(Color(
+      m.colors[j].h + dH2, m.colors[j].s + dS2, m.colors[j].l + dL2));
+
+    var expectedHues := AllHarmonyHues(m.baseHue, m.harmony);
+
+    var breaks_i := m.harmony != Harmony.Custom &&
+                    |expectedHues| == 5 && newColor_i.h != expectedHues[i];
+    var breaks_j := m.harmony != Harmony.Custom &&
+                    |expectedHues| == 5 && newColor_j.h != expectedHues[j];
+
+    // Degradation to Custom is monotonic - both paths yield same harmony
+  }
+
+  // ============================================================================
+  // Non-Commutativity: GeneratePalette resets state
+  // ============================================================================
+
+  // GeneratePalette resets adjustmentH/S/L to 0, so order matters
+  // This documents that GeneratePalette is a "checkpoint" operation
+
+  lemma GeneratePaletteResetsAdjustments(m: Model, baseHue: int, mood: Mood,
+                                          harmony: Harmony, seeds: seq<int>)
+    requires Inv(m)
+    requires ValidBaseHue(baseHue) && ValidRandomSeeds(seeds)
+    ensures Step(m, GeneratePalette(baseHue, mood, harmony, seeds)).adjustmentH == 0
+    ensures Step(m, GeneratePalette(baseHue, mood, harmony, seeds)).adjustmentS == 0
+    ensures Step(m, GeneratePalette(baseHue, mood, harmony, seeds)).adjustmentL == 0
+  {
+  }
+
+  // ============================================================================
+  // Idempotence Properties
+  // ============================================================================
+
+  // GeneratePalette with same params is idempotent
+  lemma GeneratePaletteIdempotent(m: Model, baseHue: int, mood: Mood,
+                                   harmony: Harmony, seeds: seq<int>)
+    requires Inv(m)
+    requires ValidBaseHue(baseHue) && ValidRandomSeeds(seeds)
+    ensures var m' := Step(m, GeneratePalette(baseHue, mood, harmony, seeds));
+            Step(m', GeneratePalette(baseHue, mood, harmony, seeds)) == m'
+  {
+    StepPreservesInv(m, GeneratePalette(baseHue, mood, harmony, seeds));
+  }
+
+  // ============================================================================
+  // Monotonicity of Degradation
+  // ============================================================================
+
+  // AdjustColor can only degrade mood to Custom, never restore it
+  lemma MoodOnlyDegradesToCustom(m: Model, idx: int, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    requires 0 <= idx < 5
+    ensures var m' := Step(m, AdjustColor(idx, dH, dS, dL));
+            m.mood == Mood.Custom ==> m'.mood == Mood.Custom
+    ensures var m' := Step(m, AdjustColor(idx, dH, dS, dL));
+            m'.mood != Mood.Custom ==> m'.mood == m.mood
+  {
+    StepPreservesInv(m, AdjustColor(idx, dH, dS, dL));
+  }
+
+  // AdjustColor can only degrade harmony to Custom, never restore it
+  lemma HarmonyOnlyDegradesToCustom(m: Model, idx: int, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    requires 0 <= idx < 5
+    ensures var m' := Step(m, AdjustColor(idx, dH, dS, dL));
+            m.harmony == Harmony.Custom ==> m'.harmony == Harmony.Custom
+    ensures var m' := Step(m, AdjustColor(idx, dH, dS, dL));
+            m'.harmony != Harmony.Custom ==> m'.harmony == m.harmony
+  {
+    StepPreservesInv(m, AdjustColor(idx, dH, dS, dL));
+  }
+
+  // ============================================================================
+  // Reachability
+  // ============================================================================
+
+  // Any valid color can be set at any index
+  lemma CanReachAnyColor(m: Model, idx: int, target: Color)
+    requires Inv(m)
+    requires 0 <= idx < 5
+    requires ValidColor(target)
+    ensures Step(m, SetColorDirect(idx, target)).colors[idx] == target
+  {
+  }
+
+  // Any mood can be restored via RegenerateMood
+  lemma CanRecoverMood(m: Model, targetMood: Mood, seeds: seq<int>)
+    requires Inv(m)
+    requires ValidRandomSeeds(seeds)
+    ensures Step(m, RegenerateMood(targetMood, seeds)).mood == targetMood
+  {
+  }
+
+  // Any harmony can be restored via RegenerateHarmony
+  lemma CanRecoverHarmony(m: Model, targetHarmony: Harmony, seeds: seq<int>)
+    requires Inv(m)
+    requires ValidRandomSeeds(seeds)
+    ensures Step(m, RegenerateHarmony(targetHarmony, seeds)).harmony == targetHarmony
+  {
+  }
+
+  // ============================================================================
+  // Field Independence
+  // ============================================================================
+
+  // AdjustColor never changes contrastPair
+  lemma AdjustColorPreservesContrastPair(m: Model, idx: int, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    ensures Step(m, AdjustColor(idx, dH, dS, dL)).contrastPair == m.contrastPair
+  {
+  }
+
+  // AdjustPalette never changes contrastPair
+  lemma AdjustPalettePreservesContrastPair(m: Model, dH: int, dS: int, dL: int)
+    requires Inv(m)
+    ensures Step(m, AdjustPalette(dH, dS, dL)).contrastPair == m.contrastPair
+  {
+  }
+
+  // SetColorDirect never changes contrastPair
+  lemma SetColorDirectPreservesContrastPair(m: Model, idx: int, c: Color)
+    requires Inv(m)
+    ensures Step(m, SetColorDirect(idx, c)).contrastPair == m.contrastPair
+  {
+  }
+
+  // SelectContrastPair never changes colors
+  lemma SelectContrastPairPreservesColors(m: Model, fg: int, bg: int)
+    requires Inv(m)
+    requires 0 <= fg < 5 && 0 <= bg < 5
+    ensures Step(m, SelectContrastPair(fg, bg)).colors == m.colors
+    ensures Step(m, SelectContrastPair(fg, bg)).mood == m.mood
+    ensures Step(m, SelectContrastPair(fg, bg)).harmony == m.harmony
+    ensures Step(m, SelectContrastPair(fg, bg)).baseHue == m.baseHue
+  {
+  }
+
+  // ============================================================================
+  // Domain-Specific: Harmony Geometry
+  // ============================================================================
+
+  // Complementary harmony: first two base hues are 180° apart
+  lemma ComplementaryAre180Apart(m: Model)
+    requires Inv(m)
+    requires m.harmony == Harmony.Complementary
+    ensures var hues := BaseHarmonyHues(m.baseHue, m.harmony);
+            |hues| >= 2 && hues[1] == NormalizeHue(hues[0] + 180)
+  {
+  }
+
+  // Triadic harmony: base hues are 120° apart
+  lemma TriadicAre120Apart(m: Model)
+    requires Inv(m)
+    requires m.harmony == Harmony.Triadic
+    ensures var hues := BaseHarmonyHues(m.baseHue, m.harmony);
+            |hues| >= 3 &&
+            hues[1] == NormalizeHue(hues[0] + 120) &&
+            hues[2] == NormalizeHue(hues[0] + 240)
+  {
+  }
+
+  // Analogous harmony: all hues within 30° of baseHue
+  lemma AnalogousWithin30(m: Model)
+    requires Inv(m)
+    requires m.harmony == Harmony.Analogous
+    ensures var hues := AllHarmonyHues(m.baseHue, m.harmony);
+            |hues| == 5 &&
+            hues[0] == NormalizeHue(m.baseHue - 30) &&
+            hues[1] == NormalizeHue(m.baseHue - 15) &&
+            hues[2] == m.baseHue &&
+            hues[3] == NormalizeHue(m.baseHue + 15) &&
+            hues[4] == NormalizeHue(m.baseHue + 30)
+  {
+  }
+}
